@@ -1,5 +1,6 @@
 #include "mesh_core/MeshContext.hpp"
 #include "mesh_core/Logger.hpp"
+#include <Arduino.h>
 
 static const char* TAG = "QueueMgr";
 

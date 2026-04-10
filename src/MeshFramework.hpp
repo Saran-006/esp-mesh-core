@@ -49,3 +49,4 @@
 #include "mesh_utils/Hash.hpp"
 #include "mesh_utils/UUID.hpp"
 #include "mesh_utils/Serializer.hpp"
+#include "mesh_utils/MeshTerminal.hpp"

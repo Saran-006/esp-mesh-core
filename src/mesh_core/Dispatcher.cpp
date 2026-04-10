@@ -41,19 +41,16 @@ void dispatcherTaskFn(void* param) {
             }
 
             // 2. Check dedup
-            if (ctx->dedupCache->checkAndInsert(pkt.header.packet_id)) {
-                continue; // duplicate
-            }
+            bool isDuplicate = ctx->dedupCache->checkAndInsert(pkt.header.packet_id);
 
             // 3. Record reverse route: source_hash came from last_hop_mac
-            //    This lets responses retrace the request path.
-            if (pkt.header.flags & FLAG_ROUTE_RECORD) {
+            if (!isDuplicate && (pkt.header.flags & FLAG_ROUTE_RECORD)) {
                 ctx->routeCache->recordRoute(pkt.header.source_hash,
                                              pkt.header.last_hop_mac);
             }
 
             // 4. Process packet
-            dispatcher.processPacket(pkt);
+            dispatcher.processPacket(pkt, isDuplicate);
         }
     }
 
@@ -61,72 +58,58 @@ void dispatcherTaskFn(void* param) {
     vTaskDelete(nullptr);
 }
 
-void Dispatcher::processPacket(Packet& pkt) {
+void Dispatcher::processPacket(Packet& pkt, bool isDuplicate) {
     // --- ACK packets: always consume, never forward ---
     if (pkt.isAck()) {
-        handleAck(pkt);
+        if (!isDuplicate) handleAck(pkt);
         return;
     }
 
     // --- TCP response: deliver to RequestManager ---
     if (pkt.header.flags & FLAG_TCP_RESPONSE) {
         if (isForUs(pkt)) {
-            // Extract the original request packet_id from the first 16 bytes of payload
-            if (pkt.header.payload_size >= 16) {
-                uint8_t origRequestId[16];
-                memcpy(origRequestId, pkt.payload, 16);
-
-                // Build a "clean" response packet with just the response data
-                Packet respForCaller;
-                memcpy(&respForCaller, &pkt, sizeof(Packet));
-                // Shift payload: remove the 16-byte request_id prefix
-                if (pkt.header.payload_size > 16) {
-                    memmove(respForCaller.payload, pkt.payload + 16,
-                            pkt.header.payload_size - 16);
-                    respForCaller.header.payload_size = pkt.header.payload_size - 16;
-                } else {
-                    respForCaller.header.payload_size = 0;
-                }
-
-                ctx_->requestManager->onResponseReceived(origRequestId, respForCaller);
-            }
-
-            // Also send ACK if required
-            if (pkt.isAckRequired()) {
+            // Deliver even if duplicate (for visibility), 
+            // but RequestManager will naturally ignore duplicate requestIds.
+            handleTcpResponse(pkt, isDuplicate);
+            
+            // Also send ACK if required (only once)
+            if (!isDuplicate && pkt.isAckRequired()) {
                 sendAckFor(pkt);
             }
             return;
-        } else {
-            // Not for us — route the response using cached route
+        } else if (!isDuplicate) {
             forwardPacket(pkt);
             return;
         }
+        return;
     }
 
     // --- Fragmented packets ---
     if (pkt.isFragmented()) {
-        handleFragment(pkt);
+        if (!isDuplicate) handleFragment(pkt);
         return;
     }
 
     // --- Packet is for us ---
     if (isForUs(pkt)) {
         if (pkt.isControl()) {
-            handleControl(pkt);
+            handleControl(pkt, isDuplicate);
         } else {
-            handleData(pkt);
+            handleData(pkt, isDuplicate);
         }
 
-        // Send ACK if required
-        if (pkt.isAckRequired()) {
+        // Send ACK if required (only once)
+        if (!isDuplicate && pkt.isAckRequired()) {
             sendAckFor(pkt);
         }
 
         return;
     }
 
-    // --- Not for us: forward ---
-    forwardPacket(pkt);
+    // --- Not for us: forward only if NOT a duplicate ---
+    if (!isDuplicate) {
+        forwardPacket(pkt);
+    }
 }
 
 void Dispatcher::sendAckFor(const Packet& pkt) {
@@ -167,7 +150,47 @@ void Dispatcher::handleAck(Packet& pkt) {
     }
 }
 
-void Dispatcher::handleControl(Packet& pkt) {
+void Dispatcher::handleTcpResponse(Packet& pkt, bool isDuplicate) {
+    if (pkt.header.payload_size >= 16) {
+        uint8_t origRequestId[16];
+        memcpy(origRequestId, pkt.payload, 16);
+
+        // Build a "clean" response packet with just the response data
+        Packet respForCaller;
+        memcpy(&respForCaller, &pkt, sizeof(Packet));
+        if (pkt.header.payload_size > 16) {
+            memmove(respForCaller.payload, pkt.payload + 16,
+                    pkt.header.payload_size - 16);
+            respForCaller.header.payload_size = pkt.header.payload_size - 16;
+        } else {
+            respForCaller.header.payload_size = 0;
+        }
+
+        // Send to RequestManager (it will ignore duplicates internally based on ID)
+        ctx_->requestManager->onResponseReceived(origRequestId, respForCaller);
+
+        // Also fire event for visibility
+        MeshEvent evt;
+        evt.type = MeshEventType::PACKET_RECEIVED;
+        memcpy(&evt.packetData.packet, &pkt, sizeof(Packet));
+        memcpy(evt.packetData.sender_mac, pkt.header.last_hop_mac, 6);
+        evt.packetData.isDuplicate = isDuplicate;
+        evt.packetData.isForUs = true;
+        ctx_->eventBus->post(evt);
+    }
+}
+
+void Dispatcher::handleControl(Packet& pkt, bool isDuplicate) {
+    if (isDuplicate) {
+        // Just post event for duplicate control packet visibility
+        MeshEvent evt;
+        evt.type = MeshEventType::PACKET_RECEIVED; // Or specialized CONTROL_RECEIVED if needed
+        memcpy(&evt.packetData.packet, &pkt, sizeof(Packet));
+        memcpy(evt.packetData.sender_mac, pkt.header.last_hop_mac, 6);
+        evt.packetData.isDuplicate = true;
+        ctx_->eventBus->post(evt);
+        return;
+    }
     if (pkt.header.payload_size < 1) return;
     uint8_t ctrlType = pkt.payload[0];
 
@@ -282,7 +305,7 @@ void Dispatcher::handleFragment(Packet& pkt) {
             memcpy(reassembled.payload, reassemblyBuf, reassembledLen);
             reassembled.header.payload_size = reassembledLen;
             if (isForUs(reassembled)) {
-                handleData(reassembled);
+                handleData(reassembled, false); // Reassembled is not a duplicate
             } else {
                 forwardPacket(reassembled);
             }
@@ -298,14 +321,20 @@ void Dispatcher::handleFragment(Packet& pkt) {
     }
 }
 
-void Dispatcher::handleData(Packet& pkt) {
-    LOG_INFO(TAG, "Data packet for us, %d bytes", pkt.header.payload_size);
-    onPacketReceived(ctx_, pkt, pkt.header.last_hop_mac);
+void Dispatcher::handleData(Packet& pkt, bool isDuplicate) {
+    LOG_INFO(TAG, "Data packet for us, %d bytes%s", 
+             pkt.header.payload_size, isDuplicate ? " (DUPLICATE)" : "");
+    
+    if (!isDuplicate) {
+        onPacketReceived(ctx_, pkt, pkt.header.last_hop_mac);
+    }
 
     MeshEvent evt;
     evt.type = MeshEventType::PACKET_RECEIVED;
     memcpy(&evt.packetData.packet, &pkt, sizeof(Packet));
     memcpy(evt.packetData.sender_mac, pkt.header.last_hop_mac, 6);
+    evt.packetData.isDuplicate = isDuplicate;
+    evt.packetData.isForUs = true;
     ctx_->eventBus->post(evt);
 }
 
@@ -315,6 +344,15 @@ void Dispatcher::forwardPacket(Packet& pkt) {
         onPacketDropped(ctx_, pkt, "TTL expired");
         return;
     }
+    // FIRE EVENT: Notify application of through-traffic
+    MeshEvent evt;
+    evt.type = MeshEventType::PACKET_RECEIVED;
+    memcpy(&evt.packetData.packet, &pkt, sizeof(Packet));
+    memcpy(evt.packetData.sender_mac, pkt.header.last_hop_mac, 6);
+    evt.packetData.isDuplicate = false; // logic-wise if we reach here it's not a dupe
+    evt.packetData.isForUs = false;
+    ctx_->eventBus->post(evt);
+
     pkt.header.ttl--;
 
     // Update last_hop_mac to us

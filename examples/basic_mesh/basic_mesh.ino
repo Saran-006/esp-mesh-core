@@ -1,181 +1,134 @@
 /*
  * MeshFramework — Basic Mesh Example
  *
- * This sketch demonstrates:
- *   1. Creating and configuring a Mesh instance
- *   2. Attaching a GPS provider (or manual location)
- *   3. Starting the mesh
- *   4. Subscribing to events
- *   5. Sending data in UDP or TCP mode
+ * An interactive "Mesh Terminal" for the ESP32.
+ * This sketch demonstrates how to initialize the mesh and hand control 
+ * over to the interactive CLI (Serial Monitor).
  *
- * HARDWARE:
- *   - ESP32 board
- *   - Optional: NEO-6M GPS on UART1 (RX=GPIO16, TX=GPIO17)
- *
- * LIBRARY DEPENDENCIES:
- *   - MeshFramework (this library)
- *   - TinyGPSPlus (install via Library Manager)
- *
- * SETUP:
- *   1. Copy the mesh_esp32_cpp folder into Arduino/libraries/
- *   2. Install TinyGPSPlus from Library Manager
- *   3. Select your ESP32 board in Tools > Board
- *   4. Upload this sketch
+ * AVAILABLE COMMANDS:
+ *   - ls              : List all nearby nodes (Hash, MAC, GPS, Last Seen)
+ *   - msg <hash> <txt>: Send an unacknowledged UDP message
+ *   - tcp <hash> <txt>: Perform a reliable, multi-hop TCP handshake
+ *   - geo <lat> <lon> <txt>: Route a message towards specific coordinates
+ *   - broadcast <txt> : Send to every node in range
  */
 
 #include <MeshFramework.hpp>
 
 // ---- Configuration ----
-static const uint8_t NETWORK_KEY[] = "MySecretMeshKey!";  // 16-byte shared key
+static const uint8_t NETWORK_KEY[] = "MySecretMeshKey!";
 
-// ---- GPS pins (NEO-6M) ----
-#define GPS_RX_PIN 16
-#define GPS_TX_PIN 17
+// ---- Hardware Pins (ESP32) ----
+#define GPS_RX_PIN        16
+#define GPS_TX_PIN        17
+#define INTERNAL_LED      2   // Built-in LED for traffic heartbeat
+#define EXTERNAL_LED      4   // For remote control showcase
+// WARNING: Do NOT use GPIO 1 or GPIO 3 — they are Serial TX/RX!
 
 // ---- Global instances ----
-mesh::Mesh meshNode;
+mesh::Mesh         meshNode;
+mesh::MeshTerminal terminal(meshNode);
+mesh::GPSLocationProvider gps(GPS_RX_PIN, GPS_TX_PIN, 9600, 2);
 
-// Use GPS for outdoor, or ManualLocationProvider for testing
-// mesh::GPSLocationProvider gps(GPS_RX_PIN, GPS_TX_PIN, 9600, 1);
-mesh::ManualLocationProvider location(12.9716f, 77.5946f);  // Bangalore coords for testing
-
-// ---- Event callbacks ----
+// ---- Event: New Node Discovered ----
 void onNodeFound(const mesh::MeshEvent& evt, void* ctx) {
     const mesh::Node& node = evt.nodeData.node;
-    Serial.printf("[APP] New node found: %02X:%02X:%02X:%02X:%02X:%02X at (%.4f, %.4f)\n",
-                  node.mac[0], node.mac[1], node.mac[2],
-                  node.mac[3], node.mac[4], node.mac[5],
-                  node.lat, node.lon);
+    Serial.printf("\n[APP] *** NEW NODE FOUND: %02X%02X%02X%02X ***\n", 
+                  node.node_hash[0], node.node_hash[1], node.node_hash[2], node.node_hash[3]);
 }
 
+// ---- Event: Data Packet Received ----
 void onDataReceived(const mesh::MeshEvent& evt, void* ctx) {
     const mesh::Packet& pkt = evt.packetData.packet;
-    const uint8_t* sender = pkt.header.source_hash;
+    bool isDup = evt.packetData.isDuplicate;
+    bool isMe = evt.packetData.isForUs;
+
+    // 1. DATA HEARTBEAT: Always blink internal LED for ANY traffic we touch
+    digitalWrite(INTERNAL_LED, HIGH);
+
+    // Determine type string for logging
+    String typeStr = isMe ? "" : "[ROUTE]";
+    if (pkt.header.flags & mesh::FLAG_TCP_REQUEST) typeStr += "TCP";
+    else if (pkt.header.flags & mesh::FLAG_TCP_RESPONSE) typeStr += "TCP_RESP";
+    else typeStr += "UDP";
     
-    Serial.printf("\n[APP] <<< MESSAGE RECEIVED <<<\n");
-    Serial.printf("[APP] From Node Hash: %02X%02X%02X%02X...\n", 
-                  sender[0], sender[1], sender[2], sender[3]);
-    Serial.printf("[APP] Size: %d bytes\n", pkt.header.payload_size);
+    if (isDup) typeStr += "DUP";
 
-    // Print payload as string if it looks like text
-    if (pkt.header.payload_size > 0 && pkt.header.payload_size < 200) {
-        char buf[201];
-        memcpy(buf, pkt.payload, pkt.header.payload_size);
-        buf[pkt.header.payload_size] = '\0';
-        Serial.printf("[APP] Payload: %s\n", buf);
+    // Get short ID (first 2 bytes of packet_id)
+    char idStr[5];
+    snprintf(idStr, 5, "%02X%02X", pkt.header.packet_id[0], pkt.header.packet_id[1]);
+
+    // Handle payload offsets
+    // TCP responses have [16-byte request ID] [Data...]
+    // Standard data is raw [Data...] (no control byte for user payloads)
+    size_t offset = 0;
+    if (pkt.header.flags & mesh::FLAG_TCP_RESPONSE) {
+        offset = 16; // Skip the 16-byte request ID
+    }
+    
+    if (pkt.header.payload_size > offset) {
+        String data = String((const char*)(pkt.payload + offset));
+        
+        // Only log if it's for us or we want to see the "Through-traffic" console noise
+        Serial.printf("[%s] %s %s\n", typeStr.c_str(), idStr, data.c_str());
+
+        // 2. REMOTE CONTROL: Toggle External LED ONLY if it's addressed to us
+        if (isMe) {
+            if (data == "LED_ON") {
+                digitalWrite(EXTERNAL_LED, HIGH);
+                Serial.println("[APP] Correct address: External LED -> ON");
+            } 
+            else if (data == "LED_OFF") {
+                digitalWrite(EXTERNAL_LED, LOW);
+                Serial.println("[APP] Correct address: External LED -> OFF");
+            }
+        } else {
+            // Log that we are just forwarding it
+            // Serial.println("[APP] Routing packet for someone else...");
+        }
     }
 
-    // If this is a TCP request, send a response back
-    if (pkt.header.flags & mesh::FLAG_TCP_REQUEST) {
-        Serial.println("[APP] TCP request received, sending response...");
-
-        // Build response: FLAG_TCP_RESPONSE with original packet_id in first 16 bytes
-        mesh::Packet resp;
-        memset(&resp, 0, sizeof(resp));
-        resp.header.version = 1;
-        resp.header.ttl = 10;
-        resp.header.flags = mesh::FLAG_DATA | mesh::FLAG_TCP_RESPONSE | mesh::FLAG_ROUTE_RECORD;
-        resp.header.priority = static_cast<uint8_t>(mesh::Priority::PRIO_MEDIUM);
-
-        mesh::UUID::generate(resp.header.packet_id);
-        memcpy(resp.header.source_hash,
-               meshNode.getSelf().node_hash, 16);
-        memcpy(resp.header.dest_hash,
-               pkt.header.source_hash, 16);
-
-        // First 16 bytes = original request packet_id (for RequestManager matching)
-        memcpy(resp.payload, pkt.header.packet_id, 16);
-
-        // Append response data after the request_id
-        const char* reply = "ACK:OK";
-        size_t replyLen = strlen(reply);
-        memcpy(resp.payload + 16, reply, replyLen);
-        resp.header.payload_size = 16 + replyLen;
-
-        mesh::enqueueOutgoing(meshNode.getContext(), resp);
-    }
+    delay(20); 
+    digitalWrite(INTERNAL_LED, LOW); 
 }
 
-void onLocationUpdate(const mesh::MeshEvent& evt, void* ctx) {
-    Serial.printf("[APP] Location updated: %.6f, %.6f\n",
-                  evt.locationData.lat, evt.locationData.lon);
-}
-
-// ---- Arduino setup ----
 void setup() {
     Serial.begin(115200);
     delay(1000);
+    
+    pinMode(INTERNAL_LED, OUTPUT);
+    digitalWrite(INTERNAL_LED, LOW);
+    
+    pinMode(EXTERNAL_LED, OUTPUT);
+    digitalWrite(EXTERNAL_LED, LOW);
+
     Serial.println("\n========================================");
-    Serial.println("  ESP32 Mesh Framework — Starting...");
+    Serial.println("  ESP32 Mesh Framework — CLI Terminal   ");
     Serial.println("========================================\n");
+    Serial.println("Type 'ls' to see nodes or 'help' for commands.\n");
 
-    // Configure the mesh with fluent API
+    // Configure mesh parameters
     meshNode.setMaxPeers(20)
-            .setMaxRetries(3)
-            .setQueueSize(32)
-            .setDirectionAngle(90.0f)
-            .setDistanceTolerance(500.0f)
-            .setNetworkKey(NETWORK_KEY, sizeof(NETWORK_KEY) - 1)
-            .setLocationProvider(&location);
+            .setNetworkKey(NETWORK_KEY, 16)
+            .setLocationProvider(&gps);
 
-    // Initialize
+    // Initialize (Flash, WiFi, Radio)
     meshNode.init();
 
-    // Subscribe to events
+    // Subscribe to internal events
     meshNode.getEventBus().subscribe(mesh::MeshEventType::NODE_DISCOVERED, onNodeFound);
     meshNode.getEventBus().subscribe(mesh::MeshEventType::PACKET_RECEIVED, onDataReceived);
-    meshNode.getEventBus().subscribe(mesh::MeshEventType::LOCATION_UPDATED, onLocationUpdate);
 
-    // Start the mesh
+    // Start the background tasks
     meshNode.start();
 
-    Serial.println("[APP] Mesh is running. Waiting for peers...\n");
+    Serial.println("[OK] Mesh active. Type 'help' for commands.\n");
 }
 
-// ---- Arduino loop ----
 void loop() {
-    // Process events on the main thread (optional, for event callbacks)
-    meshNode.getEventBus().processOne(pdMS_TO_TICKS(100));
-
-    // Example: send a UDP message every 15 seconds
-    static unsigned long lastSend = 0;
-    if (millis() - lastSend > 15000) {
-        lastSend = millis();
-
-        const char* msg = "Hello from mesh!";
-        uint8_t broadcastHash[16] = {};  // all zeros = broadcast
-
-        bool ok = meshNode.sendUDP(broadcastHash,
-                                    reinterpret_cast<const uint8_t*>(msg),
-                                    strlen(msg));
-        if (ok) {
-            Serial.println("[APP] UDP broadcast sent");
-        }
-    }
-
-    // Example: TCP request (uncomment to test with a known destination)
-    /*
-    static unsigned long lastTcp = 0;
-    if (millis() - lastTcp > 30000) {
-        lastTcp = millis();
-
-        uint8_t targetHash[16] = {0};  // fill with target node hash
-        const char* request = "PING";
-        mesh::MeshResponse resp = meshNode.sendTCP(
-            targetHash,
-            reinterpret_cast<const uint8_t*>(request),
-            strlen(request),
-            5000  // 5 second timeout
-        );
-
-        if (resp.success) {
-            char buf[200];
-            memcpy(buf, resp.responsePacket.payload, resp.payloadLen);
-            buf[resp.payloadLen] = '\0';
-            Serial.printf("[APP] TCP response: %s\n", buf);
-        } else {
-            Serial.println("[APP] TCP request timed out");
-        }
-    }
-    */
+    // Add debug tracing to find the crash source
+    // Serial.println("loop: processOne");
+    meshNode.getEventBus().processOne(0);
+    // Serial.println("loop: processSerial");
+    terminal.processSerial();
 }

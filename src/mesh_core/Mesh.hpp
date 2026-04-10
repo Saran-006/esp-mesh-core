@@ -57,6 +57,7 @@ public:
     MeshContext*  getContext()  { return &ctx_; }
     MeshConfig&   getConfig()  { return config_; }
     const Node&   getSelf()    const { return selfNode_; }
+    NodeRegistry& getNodeRegistry() { return *nodeRegistry_; }
     EventBus&     getEventBus(){ return eventBus_; }
 
 private:

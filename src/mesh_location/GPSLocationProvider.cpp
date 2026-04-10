@@ -13,14 +13,14 @@ GPSLocationProvider::GPSLocationProvider(int rxPin, int txPin,
 bool GPSLocationProvider::init() {
     serial_.begin(baudRate_, SERIAL_8N1, rxPin_, txPin_);
     initialized_ = true;
-    LOG_INFO(TAG, "GPS UART initialized (RX=%d TX=%d baud=%lu)", rxPin_, txPin_, baudRate_);
+    LOG_INFO(TAG, "GPS UART%d initialized (RX=%d TX=%d baud=%lu)", 
+             (int)serial_, rxPin_, txPin_, baudRate_);
     return true;
 }
 
 void GPSLocationProvider::update() {
     if (!initialized_) return;
 
-    // Read all available bytes from GPS serial (non-blocking)
     while (serial_.available() > 0) {
         char c = serial_.read();
         gps_.encode(c);
@@ -28,7 +28,10 @@ void GPSLocationProvider::update() {
 }
 
 bool GPSLocationProvider::hasValidFix() const {
-    return gps_.location.isValid() && gps_.location.isUpdated();
+    // NOTE: Do NOT use isUpdated() here! It's a one-shot flag in TinyGPS++
+    // that resets to false after being read once. isValid() stays true
+    // permanently once the GPS has decoded a valid position sentence.
+    return gps_.location.isValid();
 }
 
 float GPSLocationProvider::getLatitude() const {
@@ -40,3 +43,4 @@ float GPSLocationProvider::getLongitude() const {
 }
 
 } // namespace mesh
+

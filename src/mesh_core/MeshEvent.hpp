@@ -35,6 +35,8 @@ struct MeshEvent {
         struct {
             Packet  packet;
             uint8_t sender_mac[6];
+            bool    isDuplicate;
+            bool    isForUs;
         } packetData;
         struct {
             Node node;

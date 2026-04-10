@@ -43,7 +43,7 @@ bool RequestManager::registerRequest(const uint8_t packetId[16]) {
             xSemaphoreTake(requests_[i].sem, 0);
 
             xSemaphoreGive(mutex_);
-            LOG_INFO(TAG, "Registered TCP request slot %d", i);
+            LOG_DEBUG(TAG, "Registered TCP request slot %d", i);
             return true;
         }
     }
@@ -70,7 +70,7 @@ MeshResponse RequestManager::sendAndWait(const uint8_t packetId[16], int timeout
     xSemaphoreGive(mutex_);
 
     // Block calling task until response arrives or timeout
-    LOG_INFO(TAG, "Blocking for TCP response (timeout: %d ms)", timeoutMs);
+    LOG_DEBUG(TAG, "Blocking for TCP response (timeout: %d ms)", timeoutMs);
     BaseType_t got = xSemaphoreTake(sem, pdMS_TO_TICKS(timeoutMs));
 
     xSemaphoreTake(mutex_, portMAX_DELAY);

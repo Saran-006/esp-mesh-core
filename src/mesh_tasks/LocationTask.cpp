@@ -16,6 +16,7 @@ void locationTaskFn(void* param) {
     LOG_INFO(TAG, "Location task started (LOW priority)");
 
     bool hadFix = false;
+    unsigned long lastLocUpdate = 0;
 
     while (ctx->running) {
         if (ctx->locationProvider) {
@@ -34,26 +35,31 @@ void locationTaskFn(void* param) {
                     hadFix = true;
                 }
 
-                onLocationUpdated(ctx, lat, lon);
+                // Throttle location broadcasts to every 10 seconds
+                if (millis() - lastLocUpdate > 10000) {
+                    lastLocUpdate = millis();
 
-                // Broadcast location update to peers
-                Packet locPkt;
-                memset(&locPkt, 0, sizeof(locPkt));
-                locPkt.header.version = 1;
-                locPkt.header.ttl = 2;  // 2 hops for location updates
-                locPkt.header.flags = FLAG_CONTROL | FLAG_ROUTE_RECORD;
-                locPkt.header.priority = static_cast<uint8_t>(Priority::PRIO_MEDIUM);
+                    onLocationUpdated(ctx, lat, lon);
 
-                UUID::generate(locPkt.header.packet_id);
-                memcpy(locPkt.header.source_hash, ctx->selfNode->node_hash, 16);
-                memset(locPkt.header.dest_hash, 0, 16); // broadcast
+                    // Broadcast location update to peers
+                    Packet locPkt;
+                    memset(&locPkt, 0, sizeof(locPkt));
+                    locPkt.header.version = 1;
+                    locPkt.header.ttl = 2;  // 2 hops for location updates
+                    locPkt.header.flags = FLAG_CONTROL | FLAG_ROUTE_RECORD;
+                    locPkt.header.priority = static_cast<uint8_t>(Priority::PRIO_MEDIUM);
 
-                locPkt.payload[0] = CTRL_LOCATION_UPDATE;
-                memcpy(locPkt.payload + 1, &lat, 4);
-                memcpy(locPkt.payload + 5, &lon, 4);
-                locPkt.header.payload_size = 9;
+                    UUID::generate(locPkt.header.packet_id);
+                    memcpy(locPkt.header.source_hash, ctx->selfNode->node_hash, 16);
+                    memset(locPkt.header.dest_hash, 0, 16); // broadcast
 
-                enqueueOutgoing(ctx, locPkt);
+                    locPkt.payload[0] = CTRL_LOCATION_UPDATE;
+                    memcpy(locPkt.payload + 1, &lat, 4);
+                    memcpy(locPkt.payload + 5, &lon, 4);
+                    locPkt.header.payload_size = 9;
+
+                    enqueueOutgoing(ctx, locPkt);
+                }
             } else {
                 if (hadFix) {
                     LOG_WARN(TAG, "GPS fix lost");
@@ -63,7 +69,7 @@ void locationTaskFn(void* param) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));  // update every 2 seconds
+        vTaskDelay(pdMS_TO_TICKS(100));  // Poll serial every 100ms to prevent buffer overflow
     }
 
     LOG_INFO(TAG, "Location task stopped");

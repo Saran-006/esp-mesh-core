@@ -22,6 +22,17 @@ AckManager::~AckManager() {
 void AckManager::trackPacket(const Packet& pkt, const uint8_t destMac[6]) {
     xSemaphoreTake(mutex_, portMAX_DELAY);
 
+    // Check if we are already tracking this packet_id (idempotency for retries)
+    for (int i = 0; i < MAX_PENDING_ACKS; i++) {
+        if (entries_[i].active &&
+            memcmp(entries_[i].pkt.header.packet_id, pkt.header.packet_id, 16) == 0) {
+            entries_[i].sentAtMs = millis();
+            memcpy(entries_[i].destMac, destMac, 6);
+            xSemaphoreGive(mutex_);
+            return;
+        }
+    }
+
     // Find free slot
     for (int i = 0; i < MAX_PENDING_ACKS; i++) {
         if (!entries_[i].active) {
@@ -30,7 +41,7 @@ void AckManager::trackPacket(const Packet& pkt, const uint8_t destMac[6]) {
             entries_[i].sentAtMs = millis();
             entries_[i].retryCount = 0;
             entries_[i].active = true;
-            LOG_INFO(TAG, "Tracking packet for ACK (slot %d)", i);
+            LOG_DEBUG(TAG, "Tracking packet for ACK (slot %d)", i);
             xSemaphoreGive(mutex_);
             return;
         }
@@ -47,7 +58,7 @@ void AckManager::onAckReceived(const uint8_t packetId[16]) {
         if (entries_[i].active &&
             memcmp(entries_[i].pkt.header.packet_id, packetId, 16) == 0) {
             entries_[i].active = false;
-            LOG_INFO(TAG, "ACK matched, cleared slot %d", i);
+            LOG_DEBUG(TAG, "ACK matched, cleared slot %d", i);
             xSemaphoreGive(mutex_);
             return;
         }
@@ -58,8 +69,19 @@ void AckManager::onAckReceived(const uint8_t packetId[16]) {
 }
 
 void AckManager::processRetries(int64_t nowMs, RetryCb cb, void* userCtx) {
-    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (!cb) return;
 
+    // Local struct to avoid massive stack allocations while bridging the Mutex
+    struct RetryJob {
+        Packet pkt;
+        uint8_t destMac[6];
+    };
+    
+    // Allocate jobs on the heap to avoid blowing out HealthTask's 4096-byte stack
+    RetryJob* jobs = new RetryJob[MAX_PENDING_ACKS];
+    int jobCount = 0;
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
     for (int i = 0; i < MAX_PENDING_ACKS; i++) {
         if (!entries_[i].active) continue;
 
@@ -75,16 +97,22 @@ void AckManager::processRetries(int64_t nowMs, RetryCb cb, void* userCtx) {
 
             entries_[i].retryCount++;
             entries_[i].sentAtMs = nowMs;
-            LOG_INFO(TAG, "Retry %d/%d for slot %d",
-                     entries_[i].retryCount, maxRetries_, i);
+            LOG_DEBUG(TAG, "Retry %d/%d for slot %d", entries_[i].retryCount, maxRetries_, i);
 
-            if (cb) {
-                cb(entries_[i].pkt, entries_[i].destMac, userCtx);
-            }
+            // Copy to local heap array to defer execution outside the Mutex
+            memcpy(&jobs[jobCount].pkt, &entries_[i].pkt, sizeof(Packet));
+            memcpy(jobs[jobCount].destMac, entries_[i].destMac, 6);
+            jobCount++;
         }
     }
-
     xSemaphoreGive(mutex_);
+
+    // Execute callbacks safely OUTSIDE the Mutex
+    for (int i = 0; i < jobCount; i++) {
+        cb(jobs[i].pkt, jobs[i].destMac, userCtx);
+    }
+    
+    delete[] jobs;
 }
 
 bool AckManager::isPending(const uint8_t packetId[16]) const {

@@ -205,7 +205,7 @@ void Mesh::createTasks() {
                             3, &dispatcherTaskHandle_, 1);
 
     // SenderTask — MEDIUM priority (3)
-    xTaskCreatePinnedToCore(senderTaskFn, "mesh_send", 4096, &ctx_,
+    xTaskCreatePinnedToCore(senderTaskFn, "mesh_send", 8192, &ctx_,
                             3, &senderTaskHandle_, 1);
 
     // DiscoveryTask — MEDIUM priority (2)
@@ -231,7 +231,9 @@ bool Mesh::sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len,
                    bool ackRequired) {
     // Check if fragmentation is needed
     if (len > MAX_SINGLE_PAYLOAD) {
-        Packet fragments[32];
+        // CRITICAL: Allocate on HEAP, not stack!
+        // Packet[32] = 8000 bytes, which overflows the 8KB loop() stack.
+        Packet* fragments = new Packet[32];
         uint8_t pktId[16];
         UUID::generate(pktId);
 
@@ -253,40 +255,44 @@ bool Mesh::sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len,
 
         if (fragCount <= 0) {
             LOG_ERROR(TAG, "Fragmentation failed");
+            delete[] fragments;
             return false;
         }
 
         for (int i = 0; i < fragCount; i++) {
             enqueueOutgoing(&ctx_, fragments[i]);
         }
+        delete[] fragments;
         return true;
     }
 
-    // Single packet
-    Packet pkt;
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.header.version = 1;
-    pkt.header.ttl = config_.ttlDefault;
-    pkt.header.flags = FLAG_DATA | FLAG_ROUTE_RECORD;
-    if (ackRequired) pkt.header.flags |= FLAG_ACK_REQUIRED;
-    pkt.header.priority = static_cast<uint8_t>(Priority::PRIO_LOW);
+    // Single packet — use heap to keep loop() stack safe
+    Packet* pkt = new Packet();
+    memset(pkt, 0, sizeof(Packet));
+    pkt->header.version = 1;
+    pkt->header.ttl = config_.ttlDefault;
+    pkt->header.flags = FLAG_DATA | FLAG_ROUTE_RECORD;
+    if (ackRequired) pkt->header.flags |= FLAG_ACK_REQUIRED;
+    pkt->header.priority = static_cast<uint8_t>(Priority::PRIO_LOW);
 
-    UUID::generate(pkt.header.packet_id);
-    memcpy(pkt.header.source_hash, selfNode_.node_hash, 16);
-    memcpy(pkt.header.dest_hash, destHash, 16);
+    UUID::generate(pkt->header.packet_id);
+    memcpy(pkt->header.source_hash, selfNode_.node_hash, 16);
+    memcpy(pkt->header.dest_hash, destHash, 16);
 
     // Lookup dest coords
     const Node* destNode = nodeRegistry_->findByHash(destHash);
     if (destNode) {
-        pkt.header.dest_lat = destNode->lat;
-        pkt.header.dest_lon = destNode->lon;
+        pkt->header.dest_lat = destNode->lat;
+        pkt->header.dest_lon = destNode->lon;
     }
 
     size_t copyLen = len > MAX_SINGLE_PAYLOAD ? MAX_SINGLE_PAYLOAD : len;
-    memcpy(pkt.payload, data, copyLen);
-    pkt.header.payload_size = copyLen;
+    memcpy(pkt->payload, data, copyLen);
+    pkt->header.payload_size = copyLen;
 
-    return enqueueOutgoing(&ctx_, pkt);
+    bool result = enqueueOutgoing(&ctx_, *pkt);
+    delete pkt;
+    return result;
 }
 
 // ---- TCP Send (blocking request-response) ----

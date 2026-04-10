@@ -1,4 +1,5 @@
 #include "mesh_routing/RouteCache.hpp"
+#include "mesh_core/Logger.hpp"
 #include <Arduino.h>
 
 namespace mesh {
@@ -54,6 +55,11 @@ void RouteCache::recordRoute(const uint8_t sourceHash[16], const uint8_t receive
 }
 
 bool RouteCache::lookupNextHop(const uint8_t destHash[16], uint8_t outMac[6]) const {
+    if (!mutex_) {
+        LOG_ERROR("RouteCache", "CRITICAL: mutex_ is NULL");
+        return false;
+    }
+    LOG_INFO("RouteCache", "Taking mutex for lookup");
     xSemaphoreTake(mutex_, portMAX_DELAY);
 
     for (int i = 0; i < ROUTE_CACHE_SIZE; i++) {

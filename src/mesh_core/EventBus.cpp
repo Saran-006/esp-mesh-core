@@ -69,13 +69,12 @@ bool EventBus::processOne(TickType_t timeout) {
         return false;
     }
 
-    xSemaphoreTake(subMutex_, portMAX_DELAY);
+    // Handlers are loaded at boot time. No lock needed for iteration.
     for (int i = 0; i < MAX_EVENT_HANDLERS; i++) {
         if (subs_[i].active && subs_[i].type == event.type) {
             subs_[i].handler(event, subs_[i].userCtx);
         }
     }
-    xSemaphoreGive(subMutex_);
     return true;
 }
 

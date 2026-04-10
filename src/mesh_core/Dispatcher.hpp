@@ -13,15 +13,16 @@ public:
     explicit Dispatcher(MeshContext* ctx);
 
     // Process a single deserialized+verified packet
-    void processPacket(Packet& pkt);
+    void processPacket(Packet& pkt, bool isDuplicate);
 
 private:
     MeshContext* ctx_;
 
     void handleAck(Packet& pkt);
-    void handleControl(Packet& pkt);
+    void handleControl(Packet& pkt, bool isDuplicate);
+    void handleTcpResponse(Packet& pkt, bool isDuplicate);
     void handleFragment(Packet& pkt);
-    void handleData(Packet& pkt);
+    void handleData(Packet& pkt, bool isDuplicate);
     void forwardPacket(Packet& pkt);
     void sendAckFor(const Packet& pkt);
     bool isForUs(const Packet& pkt) const;

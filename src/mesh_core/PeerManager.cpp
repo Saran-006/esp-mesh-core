@@ -20,6 +20,13 @@ PeerManager::~PeerManager() {
 }
 
 bool PeerManager::addPeer(const uint8_t mac[6]) {
+    if (!mutex_) {
+        LOG_ERROR(TAG, "addPeer CRITICAL: mutex_ is NULL!");
+        return false;
+    }
+    LOG_INFO(TAG, "addPeer: taking mutex for %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    
     xSemaphoreTake(mutex_, portMAX_DELAY);
 
     // Check if already registered
