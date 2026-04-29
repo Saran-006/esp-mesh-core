@@ -13,17 +13,18 @@ public:
     void processSerial();
 
     // Directly execute a command string
-    void execute(const String& input);
+    // If quiet is true, it returns the output as a String instead of printing to Serial
+    String execute(const String& input, bool quiet = false);
 
 private:
     Mesh& node_;
     String buffer_;
     
-    void handleLs();
-    void handleMsg(const String& args);
-    void handleTcp(const String& args);
-    void handleGeo(const String& args);
-    void handleBroadcast(const String& args);
+    String handleLs(bool quiet);
+    String handleMsg(const String& args, bool quiet);
+    String handleTcp(const String& args, bool quiet);
+    String handleGeo(const String& args, bool quiet);
+    String handleBroadcast(const String& args, bool quiet);
 
     static void hexToBytes(String hex, uint8_t* bytes, int len);
 };
