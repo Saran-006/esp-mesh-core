@@ -198,7 +198,7 @@ bool Mesh::sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len, boo
     return enqueueOutgoing(&ctx_, pkt);
 }
 
-bool Mesh::broadcast(const uint8_t* data, size_t len) {
+bool Mesh::sendBroadcast(const uint8_t* data, size_t len) {
     uint8_t zeros[16] = {0};
     return sendUDP(zeros, data, len, false);
 }

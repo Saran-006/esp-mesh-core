@@ -13,7 +13,6 @@ namespace mesh {
 
 // Forward declarations
 class ESPNOWTransport;
-class NodeRegistry;
 class DedupCache;
 class DirectionalRouter;
 class AckManager;
@@ -21,6 +20,9 @@ class FragmentManager;
 class Dispatcher;
 class RouteCache;
 class RequestManager;
+
+// Full include needed for MAX_NODES constant and getAll() method
+#include "mesh_registry/NodeRegistry.hpp"
 
 class Mesh {
 public:
@@ -40,8 +42,8 @@ public:
     // Direct unicast UDP
     bool sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len, bool ackRequired = false);
     
-    // Direct broadcast UDP
-    bool broadcast(const uint8_t* data, size_t len);
+    // Network-wide broadcast UDP
+    bool sendBroadcast(const uint8_t* data, size_t len);
 
     // Direct unicast TCP (blocks for response)
     MeshResponse sendTCP(const uint8_t* destHash, const uint8_t* data, size_t len, int timeoutMs = 10000);
@@ -77,6 +79,20 @@ public:
     void onMeshStarted(VoidHandler handler);
     void onMeshStopped(VoidHandler handler);
     void onMeshError(ErrorHandler handler);
+
+    // ---- Peer Lookup Utilities ----
+    // Fill outArr with discovered peers. Returns count.
+    int getNodes(Node* outArr, int maxOut) { return nodeRegistry_->getAll(outArr, maxOut); }
+
+    // Get the hash of a specific peer by index (0 = first discovered).
+    // Returns true if index is valid. Use getNodes() count to know bounds.
+    bool getNodeHash(int index, uint8_t outHash[16]) {
+        Node buf[MAX_NODES];
+        int cnt = nodeRegistry_->getAll(buf, MAX_NODES);
+        if (index < 0 || index >= cnt) return false;
+        memcpy(outHash, buf[index].node_hash, 16);
+        return true;
+    }
 
     // ---- Accessors ----
     MeshContext*  getContext()  { return &ctx_; }
