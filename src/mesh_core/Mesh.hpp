@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mesh_core/MeshConfig.hpp"
+#include <functional>
 #include "mesh_core/Node.hpp"
 #include "mesh_core/ILocationProvider.hpp"
 #include "mesh_core/PeerManager.hpp"
@@ -26,47 +27,75 @@ public:
     Mesh();
     ~Mesh();
 
-    // ---- Fluent configuration (call BEFORE start) ----
-    Mesh& setMaxPeers(int n);
-    Mesh& setMaxRetries(int n);
-    Mesh& setQueueSize(int n);
-    Mesh& setDirectionAngle(float degrees);
-    Mesh& setDistanceTolerance(float meters);
-    Mesh& setNetworkKey(const uint8_t* key, size_t len);
-    Mesh& setLocationProvider(ILocationProvider* provider);
-
-    // ---- Lifecycle ----
+    // ---- Production API: Configuration & Lifecycle ----
+    // Initialize with a custom config object
+    void init(const MeshConfig& cfg);
+    
+    // Initialize with default config
     void init();
+    
     void start();
 
-    // ---- Send data (UDP mode: fire-and-forget) ----
-    bool sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len,
-                 bool ackRequired = false);
+    // ---- Production API: Messaging (Direct & Typed) ----
+    // Direct unicast UDP
+    bool sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len, bool ackRequired = false);
+    
+    // Direct broadcast UDP
+    bool broadcast(const uint8_t* data, size_t len);
 
-    // ---- Send data (TCP mode: blocks caller until response or timeout) ----
-    MeshResponse sendTCP(const uint8_t* destHash, const uint8_t* data, size_t len,
-                         int timeoutMs = 10000);
+    // Direct unicast TCP (blocks for response)
+    MeshResponse sendTCP(const uint8_t* destHash, const uint8_t* data, size_t len, int timeoutMs = 10000);
 
-    // Legacy alias
-    bool sendData(const uint8_t* destHash, const uint8_t* data, size_t len,
-                  bool ackRequired = false) {
-        return sendUDP(destHash, data, len, ackRequired);
-    }
+    // Geographic targeted messaging
+    bool sendGeo(float lat, float lon, const uint8_t* data, size_t len, bool ackRequired = false);
+
+    // ---- Production API: Event Convenience Layer (Sugar) ----
+    using PacketHandler   = std::function<void(const Packet& pkt, const uint8_t senderMac[6])>;
+    using SimplePacketHandler = std::function<void(const Packet& pkt)>;
+    using NodeHandler     = std::function<void(const Node& node)>;
+    using LocationHandler = std::function<void(float lat, float lon)>;
+    using VoidHandler     = std::function<void()>;
+    using ServiceHandler  = std::function<void(uint8_t service_id)>;
+    using ErrorHandler    = std::function<void(int error_code)>;
+
+    void onPacketReceived(PacketHandler handler);
+    void onPacketSent(SimplePacketHandler handler);
+    void onPacketDropped(SimplePacketHandler handler);
+    void onPacketAckReceived(SimplePacketHandler handler);
+    void onPacketAckTimeout(SimplePacketHandler handler);
+
+    void onNodeDiscovered(NodeHandler handler);
+    void onNodeLost(NodeHandler handler);
+    void onNodeUpdated(NodeHandler handler);
+
+    void onLocationUpdated(LocationHandler handler);
+    void onLocationLost(VoidHandler handler);
+
+    void onServiceRegistered(ServiceHandler handler);
+    void onServiceUnregistered(ServiceHandler handler);
+
+    void onMeshStarted(VoidHandler handler);
+    void onMeshStopped(VoidHandler handler);
+    void onMeshError(ErrorHandler handler);
 
     // ---- Accessors ----
     MeshContext*  getContext()  { return &ctx_; }
-    MeshConfig&   getConfig()  { return config_; }
-    const Node&   getSelf()    const { return selfNode_; }
+    MeshConfig&   getConfig()   { return config_; }
+    const Node&   getSelf()     const { return selfNode_; }
     NodeRegistry& getNodeRegistry() { return *nodeRegistry_; }
-    EventBus&     getEventBus(){ return eventBus_; }
+    EventBus&     getEventBus()  { return eventBus_; }
 
 private:
     MeshConfig         config_;
     Node               selfNode_;
-    MeshContext         ctx_;
+    MeshContext        ctx_;
     EventBus           eventBus_;
 
-    // Subsystem instances (allocated on init)
+    // Default event handling for print-only fallback
+    bool               hasUserPacketHandler = false;
+    bool               hasUserNodeHandler   = false;
+
+    // Subsystem instances
     ESPNOWTransport*   transport_;
     PeerManager*       peerManager_;
     NodeRegistry*      nodeRegistry_;
@@ -91,6 +120,7 @@ private:
     void createQueues();
     void createTasks();
     void initSelfNode();
+    void setupDefaultEventHandlers();
 };
 
 } // namespace mesh

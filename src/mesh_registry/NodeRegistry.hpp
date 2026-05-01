@@ -29,6 +29,9 @@ public:
     // Get number of known nodes
     int count() const;
 
+    // Remove a node by MAC address (Self-Healing)
+    void removeByMac(const uint8_t mac[6]);
+
     // Iterate: fills outArr up to maxOut, returns count
     int getAll(Node* outArr, int maxOut) const;
 

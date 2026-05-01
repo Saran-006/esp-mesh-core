@@ -21,7 +21,7 @@ FragmentManager::~FragmentManager() {
 
 int FragmentManager::fragment(const uint8_t* sourceHash, const uint8_t* destHash,
                               const uint8_t* packetId, uint8_t flags, uint8_t priority,
-                              float destLat, float destLon, uint8_t ttl,
+                              uint8_t strategy, float destLat, float destLon, uint8_t ttl,
                               const uint8_t* payload, size_t payloadLen,
                               Packet* outPkts, int maxOut) {
     size_t maxChunk = MAX_SINGLE_PAYLOAD;
@@ -45,6 +45,7 @@ int FragmentManager::fragment(const uint8_t* sourceHash, const uint8_t* destHash
         outPkts[i].header.ttl = ttl;
         outPkts[i].header.flags = flags | FLAG_FRAGMENTED;
         outPkts[i].header.priority = priority;
+        outPkts[i].header.routing_strategy = strategy;
 
         memcpy(outPkts[i].header.packet_id, packetId, 16);
         memcpy(outPkts[i].header.source_hash, sourceHash, 16);
@@ -63,7 +64,7 @@ int FragmentManager::fragment(const uint8_t* sourceHash, const uint8_t* destHash
         outPkts[i].header.payload_size = chunkLen;
     }
 
-    LOG_INFO(TAG, "Fragmented %d bytes into %d fragments", (int)payloadLen, totalFragments);
+    LOG_INFO(TAG, "Fragmented %d bytes into %d fragments (Strategy: %d)", (int)payloadLen, totalFragments, strategy);
     return totalFragments;
 }
 

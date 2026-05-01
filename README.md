@@ -1,4 +1,4 @@
-# VortexaMesh
+# Decentralized ESP32 Mesh Framework
 
 A robust, FreeRTOS-based mesh networking framework for ESP32 devices utilizing the ESP-NOW protocol. This framework provides an advanced layer over standard ESP-NOW, offering reliable multi-hop routing, packet fragmentation, hardware-accelerated cryptographic signing, and an interactive Command Line Interface (CLI).
 

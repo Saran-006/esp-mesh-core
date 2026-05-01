@@ -52,50 +52,15 @@ Mesh::~Mesh() {
     delete requestManager_;
 }
 
-// ---- Fluent configuration ----
+// ---- Production API: Configuration & Lifecycle ----
 
-Mesh& Mesh::setMaxPeers(int n) {
-    config_.maxPeers = n;
-    return *this;
+void Mesh::init(const MeshConfig& cfg) {
+    config_ = cfg;
+    init();
 }
-
-Mesh& Mesh::setMaxRetries(int n) {
-    config_.maxRetries = n;
-    return *this;
-}
-
-Mesh& Mesh::setQueueSize(int n) {
-    config_.outgoingQueueSize = n;
-    config_.eventQueueSize = n;
-    return *this;
-}
-
-Mesh& Mesh::setDirectionAngle(float degrees) {
-    config_.angleThreshold = degrees;
-    return *this;
-}
-
-Mesh& Mesh::setDistanceTolerance(float meters) {
-    config_.distanceTolerance = meters;
-    return *this;
-}
-
-Mesh& Mesh::setNetworkKey(const uint8_t* key, size_t len) {
-    size_t copyLen = len > 32 ? 32 : len;
-    memcpy(config_.networkKey, key, copyLen);
-    config_.networkKeyLen = copyLen;
-    return *this;
-}
-
-Mesh& Mesh::setLocationProvider(ILocationProvider* provider) {
-    locationProvider_ = provider;
-    return *this;
-}
-
-// ---- Lifecycle ----
 
 void Mesh::init() {
-    LOG_INFO(TAG, "Initializing mesh...");
+    LOG_INFO(TAG, "Initializing mesh (Framework Mode)...");
 
     // Initialize NVS
     esp_err_t nvs_err = nvs_flash_init();
@@ -119,6 +84,9 @@ void Mesh::init() {
 
     // Initialize event bus
     eventBus_.init(config_.eventQueueSize);
+
+    // Setup print-fallback handlers BEFORE user can subscribe
+    setupDefaultEventHandlers();
 
     // Create queues
     createQueues();
@@ -153,7 +121,7 @@ void Mesh::init() {
     // Create dispatcher (uses context)
     dispatcher_ = new Dispatcher(&ctx_);
 
-    LOG_INFO(TAG, "Mesh initialized");
+    LOG_INFO(TAG, "Mesh initialized with %d peers limit", config_.maxPeers);
 }
 
 void Mesh::start() {
@@ -169,182 +137,266 @@ void Mesh::start() {
              selfNode_.node_hash[2], selfNode_.node_hash[3]);
 }
 
-void Mesh::initSelfNode() {
-    uint8_t mac[6];
-    transport_->getOwnMac(mac);
-    memcpy(selfNode_.mac, mac, 6);
-    Hash::nodeHashFromMac(mac, selfNode_.node_hash);
-    selfNode_.lat = 0;
-    selfNode_.lon = 0;
-    selfNode_.last_seen = millis();
+// ---- Production API: Messaging (Direct & Typed) ----
 
-    LOG_INFO(TAG, "Self: MAC=%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-void Mesh::createQueues() {
-    ctx_.rawIncomingQueue   = xQueueCreate(config_.eventQueueSize, sizeof(RawIncoming));
-    ctx_.packetQueue        = xQueueCreate(config_.eventQueueSize, sizeof(Packet));
-    ctx_.outgoingQueueHigh  = xQueueCreate(config_.outgoingQueueSize / 2 + 1, sizeof(Packet));
-    ctx_.outgoingQueueMed   = xQueueCreate(config_.outgoingQueueSize / 2 + 1, sizeof(Packet));
-    ctx_.outgoingQueueLow   = xQueueCreate(config_.outgoingQueueSize, sizeof(Packet));
-
-    if (!ctx_.rawIncomingQueue || !ctx_.packetQueue ||
-        !ctx_.outgoingQueueHigh || !ctx_.outgoingQueueMed || !ctx_.outgoingQueueLow) {
-        LOG_ERROR(TAG, "Failed to create queues!");
-    }
-}
-
-void Mesh::createTasks() {
-    // ReceiverTask — HIGH priority (5)
-    xTaskCreatePinnedToCore(receiverTaskFn, "mesh_recv", 4096, &ctx_,
-                            5, &receiverTaskHandle_, 1);
-
-    // DispatcherTask — MEDIUM priority (3)
-    xTaskCreatePinnedToCore(dispatcherTaskFn, "mesh_disp", 8192, &ctx_,
-                            3, &dispatcherTaskHandle_, 1);
-
-    // SenderTask — MEDIUM priority (3)
-    xTaskCreatePinnedToCore(senderTaskFn, "mesh_send", 8192, &ctx_,
-                            3, &senderTaskHandle_, 1);
-
-    // DiscoveryTask — MEDIUM priority (2)
-    xTaskCreatePinnedToCore(discoveryTaskFn, "mesh_disc", 4096, &ctx_,
-                            2, &discoveryTaskHandle_, 0);
-
-    // LocationTask — LOW priority (1)
-    if (locationProvider_) {
-        xTaskCreatePinnedToCore(locationTaskFn, "mesh_loc", 4096, &ctx_,
-                                1, &locationTaskHandle_, 0);
-    }
-
-    // HealthTask — LOW priority (1)
-    xTaskCreatePinnedToCore(healthTaskFn, "mesh_health", 4096, &ctx_,
-                            1, &healthTaskHandle_, 0);
-
-    LOG_INFO(TAG, "All tasks created");
-}
-
-// ---- UDP Send (fire-and-forget) ----
-
-bool Mesh::sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len,
-                   bool ackRequired) {
-    // Check if fragmentation is needed
+bool Mesh::sendUDP(const uint8_t* destHash, const uint8_t* data, size_t len, bool ackRequired) {
     if (len > MAX_SINGLE_PAYLOAD) {
-        // CRITICAL: Allocate on HEAP, not stack!
-        // Packet[32] = 8000 bytes, which overflows the 8KB loop() stack.
         Packet* fragments = new Packet[32];
         uint8_t pktId[16];
         UUID::generate(pktId);
-
         uint8_t flags = FLAG_DATA | FLAG_ROUTE_RECORD;
         if (ackRequired) flags |= FLAG_ACK_REQUIRED;
 
-        // Get dest coordinates from registry if available
-        float destLat = 0, destLon = 0;
-        const Node* destNode = nodeRegistry_->findByHash(destHash);
-        if (destNode) {
-            destLat = destNode->lat;
-            destLon = destNode->lon;
+        float dLat = 0, dLon = 0;
+        const Node* n = nodeRegistry_->findByHash(destHash);
+        if (n) { dLat = n->lat; dLon = n->lon; }
+
+        uint8_t cachedMac[6];
+        uint8_t strat = (uint8_t)RoutingStrategy::STRAT_BROADCAST;
+        if (routeCache_->lookupNextHop(destHash, cachedMac)) {
+            strat = (uint8_t)RoutingStrategy::STRAT_DIRECT;
+        } else if (dLat != 0.0f) {
+            strat = (uint8_t)RoutingStrategy::STRAT_GEO_FLOOD;
         }
 
-        int fragCount = fragmentManager_->fragment(
-            selfNode_.node_hash, destHash, pktId, flags,
-            static_cast<uint8_t>(Priority::PRIO_LOW), destLat, destLon,
-            config_.ttlDefault, data, len, fragments, 32);
-
-        if (fragCount <= 0) {
-            LOG_ERROR(TAG, "Fragmentation failed");
-            delete[] fragments;
-            return false;
-        }
-
-        for (int i = 0; i < fragCount; i++) {
-            enqueueOutgoing(&ctx_, fragments[i]);
-        }
+        int fragCount = fragmentManager_->fragment(selfNode_.node_hash, destHash, pktId, flags, 
+                                                  (uint8_t)Priority::PRIO_LOW, strat, dLat, dLon, 
+                                                  config_.ttlDefault, data, len, fragments, 32);
+        if (fragCount <= 0) { delete[] fragments; return false; }
+        for (int i = 0; i < fragCount; i++) enqueueOutgoing(&ctx_, fragments[i]);
         delete[] fragments;
         return true;
     }
 
-    // Single packet — use heap to keep loop() stack safe
-    Packet* pkt = new Packet();
-    memset(pkt, 0, sizeof(Packet));
-    pkt->header.version = 1;
-    pkt->header.ttl = config_.ttlDefault;
-    pkt->header.flags = FLAG_DATA | FLAG_ROUTE_RECORD;
-    if (ackRequired) pkt->header.flags |= FLAG_ACK_REQUIRED;
-    pkt->header.priority = static_cast<uint8_t>(Priority::PRIO_LOW);
+    Packet pkt;
+    memset(&pkt, 0, sizeof(Packet));
+    pkt.header.version = 1;
+    pkt.header.ttl = config_.ttlDefault;
+    pkt.header.flags = FLAG_DATA | FLAG_ROUTE_RECORD;
+    if (ackRequired) pkt.header.flags |= FLAG_ACK_REQUIRED;
+    pkt.header.priority = (uint8_t)Priority::PRIO_LOW;
+    UUID::generate(pkt.header.packet_id);
+    memcpy(pkt.header.source_hash, selfNode_.node_hash, 16);
+    memcpy(pkt.header.dest_hash, destHash, 16);
 
-    UUID::generate(pkt->header.packet_id);
-    memcpy(pkt->header.source_hash, selfNode_.node_hash, 16);
-    memcpy(pkt->header.dest_hash, destHash, 16);
-
-    // Lookup dest coords
-    const Node* destNode = nodeRegistry_->findByHash(destHash);
-    if (destNode) {
-        pkt->header.dest_lat = destNode->lat;
-        pkt->header.dest_lon = destNode->lon;
+    const Node* n = nodeRegistry_->findByHash(destHash);
+    if (n) {
+        pkt.header.dest_lat = n->lat; pkt.header.dest_lon = n->lon;
     }
 
-    size_t copyLen = len > MAX_SINGLE_PAYLOAD ? MAX_SINGLE_PAYLOAD : len;
-    memcpy(pkt->payload, data, copyLen);
-    pkt->header.payload_size = copyLen;
-
-    bool result = enqueueOutgoing(&ctx_, *pkt);
-    delete pkt;
-    return result;
+    uint8_t cachedMac[6];
+    if (routeCache_->lookupNextHop(destHash, cachedMac)) {
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_DIRECT;
+    } else if (n && n->hasLocation()) {
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_GEO_FLOOD;
+    } else {
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_BROADCAST;
+    }
+    
+    memcpy(pkt.payload, data, (len > MAX_SINGLE_PAYLOAD ? MAX_SINGLE_PAYLOAD : len));
+    pkt.header.payload_size = len;
+    return enqueueOutgoing(&ctx_, pkt);
 }
 
-// ---- TCP Send (blocking request-response) ----
+bool Mesh::broadcast(const uint8_t* data, size_t len) {
+    uint8_t zeros[16] = {0};
+    return sendUDP(zeros, data, len, false);
+}
 
-MeshResponse Mesh::sendTCP(const uint8_t* destHash, const uint8_t* data, size_t len,
-                           int timeoutMs) {
-    MeshResponse failResp;
-    failResp.success = false;
-    failResp.payloadLen = 0;
+MeshResponse Mesh::sendTCP(const uint8_t* destHash, const uint8_t* data, size_t len, int timeoutMs) {
+    MeshResponse fail; fail.success = false;
+    if (len > MAX_SINGLE_PAYLOAD - 16) return fail;
 
-    if (len > MAX_SINGLE_PAYLOAD - 16) {
-        // TCP mode requires space for request_id in response payload
-        LOG_ERROR(TAG, "TCP payload too large (max %d)", (int)(MAX_SINGLE_PAYLOAD - 16));
-        return failResp;
-    }
-
-    // Build request packet
     Packet pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.header.version = 1;
     pkt.header.ttl = config_.ttlDefault;
     pkt.header.flags = FLAG_DATA | FLAG_TCP_REQUEST | FLAG_ACK_REQUIRED | FLAG_ROUTE_RECORD;
-    pkt.header.priority = static_cast<uint8_t>(Priority::PRIO_MEDIUM);
-
+    pkt.header.priority = (uint8_t)Priority::PRIO_MEDIUM;
     UUID::generate(pkt.header.packet_id);
     memcpy(pkt.header.source_hash, selfNode_.node_hash, 16);
     memcpy(pkt.header.dest_hash, destHash, 16);
 
-    const Node* destNode = nodeRegistry_->findByHash(destHash);
-    if (destNode) {
-        pkt.header.dest_lat = destNode->lat;
-        pkt.header.dest_lon = destNode->lon;
+    const Node* n = nodeRegistry_->findByHash(destHash);
+    if (n) {
+        pkt.header.dest_lat = n->lat; pkt.header.dest_lon = n->lon;
+    }
+
+    uint8_t cachedMac[6];
+    if (routeCache_->lookupNextHop(destHash, cachedMac)) {
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_DIRECT;
+    } else if (n && n->hasLocation()) {
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_GEO_FLOOD;
+    } else {
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_BROADCAST;
     }
 
     memcpy(pkt.payload, data, len);
     pkt.header.payload_size = len;
 
-    // Register the request BEFORE enqueuing
-    if (!requestManager_->registerRequest(pkt.header.packet_id)) {
-        LOG_ERROR(TAG, "Failed to register TCP request");
-        return failResp;
-    }
+    if (!requestManager_->registerRequest(pkt.header.packet_id)) return fail;
+    if (!enqueueOutgoing(&ctx_, pkt)) { requestManager_->cancelRequest(pkt.header.packet_id); return fail; }
 
-    // Enqueue the packet
-    if (!enqueueOutgoing(&ctx_, pkt)) {
-        requestManager_->cancelRequest(pkt.header.packet_id);
-        LOG_ERROR(TAG, "Failed to enqueue TCP request");
-        return failResp;
-    }
-
-    // Block the calling task until response arrives or timeout
     return requestManager_->sendAndWait(pkt.header.packet_id, timeoutMs);
+}
+
+bool Mesh::sendGeo(float lat, float lon, const uint8_t* data, size_t len, bool ackRequired) {
+    uint8_t zeros[16] = {0};
+    Packet pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.header.version = 1;
+    pkt.header.ttl = config_.ttlDefault;
+    pkt.header.flags = FLAG_DATA | FLAG_ROUTE_RECORD;
+    if (ackRequired) pkt.header.flags |= FLAG_ACK_REQUIRED;
+    pkt.header.priority = (uint8_t)Priority::PRIO_LOW;
+    UUID::generate(pkt.header.packet_id);
+    memcpy(pkt.header.source_hash, selfNode_.node_hash, 16);
+    memcpy(pkt.header.dest_hash, zeros, 16);
+
+    pkt.header.dest_lat = lat;
+    pkt.header.dest_lon = lon;
+    pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_GEO_FLOOD;
+
+    memcpy(pkt.payload, data, (len > MAX_SINGLE_PAYLOAD ? MAX_SINGLE_PAYLOAD : len));
+    pkt.header.payload_size = len;
+    return enqueueOutgoing(&ctx_, pkt);
+}
+
+// ---- Production API: Event Convenience Layer (Sugar) ----
+
+void Mesh::onPacketReceived(PacketHandler handler) {
+    hasUserPacketHandler = true;
+    eventBus_.subscribe(MeshEventType::PACKET_RECEIVED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.packetData.packet, ev.packetData.sender_mac);
+    }, nullptr);
+}
+
+void Mesh::onNodeDiscovered(NodeHandler handler) {
+    hasUserNodeHandler = true;
+    eventBus_.subscribe(MeshEventType::NODE_DISCOVERED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.nodeData.node);
+    }, nullptr);
+}
+
+void Mesh::onLocationUpdated(LocationHandler handler) {
+    eventBus_.subscribe(MeshEventType::LOCATION_UPDATED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.locationData.lat, ev.locationData.lon);
+    }, nullptr);
+}
+
+void Mesh::onPacketSent(SimplePacketHandler handler) {
+    eventBus_.subscribe(MeshEventType::PACKET_SENT, [handler](const MeshEvent& ev, void*) {
+        handler(ev.packetData.packet);
+    }, nullptr);
+}
+
+void Mesh::onPacketDropped(SimplePacketHandler handler) {
+    eventBus_.subscribe(MeshEventType::PACKET_DROPPED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.packetData.packet);
+    }, nullptr);
+}
+
+void Mesh::onPacketAckReceived(SimplePacketHandler handler) {
+    eventBus_.subscribe(MeshEventType::PACKET_ACK_RECEIVED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.packetData.packet);
+    }, nullptr);
+}
+
+void Mesh::onPacketAckTimeout(SimplePacketHandler handler) {
+    eventBus_.subscribe(MeshEventType::PACKET_ACK_TIMEOUT, [handler](const MeshEvent& ev, void*) {
+        handler(ev.packetData.packet);
+    }, nullptr);
+}
+
+void Mesh::onNodeLost(NodeHandler handler) {
+    eventBus_.subscribe(MeshEventType::NODE_LOST, [handler](const MeshEvent& ev, void*) {
+        handler(ev.nodeData.node);
+    }, nullptr);
+}
+
+void Mesh::onNodeUpdated(NodeHandler handler) {
+    eventBus_.subscribe(MeshEventType::NODE_UPDATED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.nodeData.node);
+    }, nullptr);
+}
+
+void Mesh::onLocationLost(VoidHandler handler) {
+    eventBus_.subscribe(MeshEventType::LOCATION_LOST, [handler](const MeshEvent& ev, void*) {
+        handler();
+    }, nullptr);
+}
+
+void Mesh::onServiceRegistered(ServiceHandler handler) {
+    eventBus_.subscribe(MeshEventType::SERVICE_REGISTERED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.serviceData.service_id);
+    }, nullptr);
+}
+
+void Mesh::onServiceUnregistered(ServiceHandler handler) {
+    eventBus_.subscribe(MeshEventType::SERVICE_UNREGISTERED, [handler](const MeshEvent& ev, void*) {
+        handler(ev.serviceData.service_id);
+    }, nullptr);
+}
+
+void Mesh::onMeshStarted(VoidHandler handler) {
+    eventBus_.subscribe(MeshEventType::MESH_STARTED, [handler](const MeshEvent& ev, void*) {
+        handler();
+    }, nullptr);
+}
+
+void Mesh::onMeshStopped(VoidHandler handler) {
+    eventBus_.subscribe(MeshEventType::MESH_STOPPED, [handler](const MeshEvent& ev, void*) {
+        handler();
+    }, nullptr);
+}
+
+void Mesh::onMeshError(ErrorHandler handler) {
+    eventBus_.subscribe(MeshEventType::MESH_ERROR, [handler](const MeshEvent& ev, void*) {
+        handler(ev.errorData.error_code);
+    }, nullptr);
+}
+
+void Mesh::setupDefaultEventHandlers() {
+    // Default Fallback: If no user handler is set, log received packets to Serial
+    eventBus_.subscribe(MeshEventType::PACKET_RECEIVED, [this](const MeshEvent& ev, void*) {
+        if (!hasUserPacketHandler && ev.packetData.isForUs && !ev.packetData.isDuplicate) {
+            LOG_INFO("DEFAULT", "Packet from %02X:%02X... size=%d", 
+                     ev.packetData.sender_mac[0], ev.packetData.sender_mac[1], ev.packetData.packet.header.payload_size);
+        }
+    }, nullptr);
+
+    eventBus_.subscribe(MeshEventType::NODE_DISCOVERED, [this](const MeshEvent& ev, void*) {
+        if (!hasUserNodeHandler) {
+            LOG_INFO("DEFAULT", "New Node: %02X%02X...", ev.nodeData.node.node_hash[0], ev.nodeData.node.node_hash[1]);
+        }
+    }, nullptr);
+}
+
+void Mesh::initSelfNode() {
+    uint8_t mac[6];
+    transport_->getOwnMac(mac);
+    memcpy(selfNode_.mac, mac, 6);
+    Hash::nodeHashFromMac(mac, selfNode_.node_hash);
+    selfNode_.lat = 0; selfNode_.lon = 0;
+    selfNode_.last_seen = millis();
+    LOG_INFO(TAG, "Self: MAC=%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void Mesh::createQueues() {
+    ctx_.rawIncomingQueue = xQueueCreate(config_.eventQueueSize, sizeof(RawIncoming));
+    ctx_.packetQueue = xQueueCreate(config_.eventQueueSize, sizeof(Packet));
+    ctx_.outgoingQueueHigh = xQueueCreate(config_.outgoingQueueSize / 2 + 1, sizeof(Packet));
+    ctx_.outgoingQueueMed = xQueueCreate(config_.outgoingQueueSize / 2 + 1, sizeof(Packet));
+    ctx_.outgoingQueueLow = xQueueCreate(config_.outgoingQueueSize, sizeof(Packet));
+}
+
+void Mesh::createTasks() {
+    xTaskCreatePinnedToCore(receiverTaskFn, "mesh_recv", 4096, &ctx_, 5, &receiverTaskHandle_, 1);
+    xTaskCreatePinnedToCore(dispatcherTaskFn, "mesh_disp", 8192, &ctx_, 3, &dispatcherTaskHandle_, 1);
+    xTaskCreatePinnedToCore(senderTaskFn, "mesh_send", 8192, &ctx_, 3, &senderTaskHandle_, 1);
+    xTaskCreatePinnedToCore(discoveryTaskFn, "mesh_disc", 4096, &ctx_, 2, &discoveryTaskHandle_, 0);
+    if (locationProvider_) xTaskCreatePinnedToCore(locationTaskFn, "mesh_loc", 4096, &ctx_, 1, &locationTaskHandle_, 0);
+    xTaskCreatePinnedToCore(healthTaskFn, "mesh_health", 4096, &ctx_, 1, &healthTaskHandle_, 0);
 }
 
 } // namespace mesh

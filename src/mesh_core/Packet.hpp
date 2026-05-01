@@ -16,12 +16,11 @@ constexpr uint8_t FLAG_ROUTE_RECORD  = 0x20;
 constexpr uint8_t FLAG_TCP_REQUEST   = 0x40;
 constexpr uint8_t FLAG_TCP_RESPONSE  = 0x80;
 
-// ---- Priority ----
-// Named PRIO_* to avoid collision with Arduino's #define LOW / #define HIGH
-enum class Priority : uint8_t {
-    PRIO_LOW    = 0,  // data payload
-    PRIO_MEDIUM = 1,  // location
-    PRIO_HIGH   = 2   // control packets
+// ---- Routing Strategy ----
+enum class RoutingStrategy : uint8_t {
+    STRAT_DIRECT    = 0,  // Use specific next hop (RouteCache)
+    STRAT_GEO_FLOOD = 1,  // Multi-target directional flood
+    STRAT_BROADCAST = 2   // Universal flood (blind broadcast)
 };
 
 // ---- Packed Packet Header ----
@@ -30,6 +29,7 @@ struct __attribute__((packed)) PacketHeader {
     uint8_t  ttl;
     uint8_t  flags;
     uint8_t  priority;
+    uint8_t  routing_strategy;
     uint16_t payload_size;
 
     uint8_t  packet_id[16];

@@ -103,8 +103,15 @@ int NodeRegistry::pruneStale(int64_t nowMs, int timeoutMs) {
     return removed;
 }
 
-int NodeRegistry::count() const {
-    return count_;
+void NodeRegistry::removeByMac(const uint8_t mac[6]) {
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (nodes_[i].last_seen > 0 && memcmp(nodes_[i].mac, mac, 6) == 0) {
+            memset(&nodes_[i], 0, sizeof(Node));
+            count_--;
+        }
+    }
+    xSemaphoreGive(mutex_);
 }
 
 int NodeRegistry::getAll(Node* outArr, int maxOut) const {

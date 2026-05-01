@@ -24,7 +24,8 @@ public:
     // Check for timed-out entries, retry or discard.
     // Returns packets to re-send via the provided callback.
     using RetryCb = void(*)(const Packet& pkt, const uint8_t destMac[6], void* userCtx);
-    void processRetries(int64_t nowMs, RetryCb cb, void* userCtx);
+    using FailureCb = void(*)(const uint8_t destMac[6], void* userCtx);
+    void processRetries(int64_t nowMs, RetryCb rcb, FailureCb fcb, void* userCtx);
 
     // Check if a packet_id is pending ACK
     bool isPending(const uint8_t packetId[16]) const;

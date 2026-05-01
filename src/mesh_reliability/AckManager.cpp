@@ -68,16 +68,15 @@ void AckManager::onAckReceived(const uint8_t packetId[16]) {
     xSemaphoreGive(mutex_);
 }
 
-void AckManager::processRetries(int64_t nowMs, RetryCb cb, void* userCtx) {
-    if (!cb) return;
+void AckManager::processRetries(int64_t nowMs, RetryCb rcb, FailureCb fcb, void* userCtx) {
+    if (!rcb) return;
 
-    // Local struct to avoid massive stack allocations while bridging the Mutex
     struct RetryJob {
         Packet pkt;
         uint8_t destMac[6];
+        bool failure;
     };
     
-    // Allocate jobs on the heap to avoid blowing out HealthTask's 4096-byte stack
     RetryJob* jobs = new RetryJob[MAX_PENDING_ACKS];
     int jobCount = 0;
 
@@ -92,6 +91,10 @@ void AckManager::processRetries(int64_t nowMs, RetryCb cb, void* userCtx) {
             if (entries_[i].retryCount >= maxRetries_) {
                 LOG_WARN(TAG, "Max retries reached, giving up on slot %d", i);
                 entries_[i].active = false;
+                
+                memcpy(jobs[jobCount].destMac, entries_[i].destMac, 6);
+                jobs[jobCount].failure = true;
+                jobCount++;
                 continue;
             }
 
@@ -99,17 +102,20 @@ void AckManager::processRetries(int64_t nowMs, RetryCb cb, void* userCtx) {
             entries_[i].sentAtMs = nowMs;
             LOG_DEBUG(TAG, "Retry %d/%d for slot %d", entries_[i].retryCount, maxRetries_, i);
 
-            // Copy to local heap array to defer execution outside the Mutex
             memcpy(&jobs[jobCount].pkt, &entries_[i].pkt, sizeof(Packet));
             memcpy(jobs[jobCount].destMac, entries_[i].destMac, 6);
+            jobs[jobCount].failure = false;
             jobCount++;
         }
     }
     xSemaphoreGive(mutex_);
 
-    // Execute callbacks safely OUTSIDE the Mutex
     for (int i = 0; i < jobCount; i++) {
-        cb(jobs[i].pkt, jobs[i].destMac, userCtx);
+        if (jobs[i].failure) {
+            if (fcb) fcb(jobs[i].destMac, userCtx);
+        } else {
+            rcb(jobs[i].pkt, jobs[i].destMac, userCtx);
+        }
     }
     
     delete[] jobs;

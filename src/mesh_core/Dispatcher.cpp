@@ -349,7 +349,7 @@ void Dispatcher::forwardPacket(Packet& pkt) {
     evt.type = MeshEventType::PACKET_RECEIVED;
     memcpy(&evt.packetData.packet, &pkt, sizeof(Packet));
     memcpy(evt.packetData.sender_mac, pkt.header.last_hop_mac, 6);
-    evt.packetData.isDuplicate = false; // logic-wise if we reach here it's not a dupe
+    evt.packetData.isDuplicate = false; 
     evt.packetData.isForUs = false;
     ctx_->eventBus->post(evt);
 
@@ -360,47 +360,27 @@ void Dispatcher::forwardPacket(Packet& pkt) {
     ctx_->transport->getOwnMac(ourMac);
     memcpy(pkt.header.last_hop_mac, ourMac, 6);
 
-    // --- Priority 1: Use cached route (reverse path) ---
+    // --- DECIDE ROUTING STRATEGY ---
     uint8_t cachedMac[6];
     if (ctx_->routeCache->lookupNextHop(pkt.header.dest_hash, cachedMac)) {
-        LOG_INFO(TAG, "Forwarding via cached route");
-        ctx_->peerManager->addPeer(cachedMac);
-        if (ctx_->config->networkKeyLen > 0) {
-            Security::signPacket(pkt, ctx_->config->networkKey, ctx_->config->networkKeyLen);
-        }
-        enqueueOutgoing(ctx_, pkt);
-        return;
-    }
-
-    // --- Priority 2: Directional routing ---
-    bool selfHasLoc = ctx_->selfNode->hasLocation();
-    bool pktHasDest = (pkt.header.dest_lat != 0.0f || pkt.header.dest_lon != 0.0f);
-
-    if (selfHasLoc && pktHasDest) {
-        uint8_t nextHopMac[6];
-        if (ctx_->router->selectNextHop(pkt, *ctx_->selfNode, nextHopMac)) {
-            if (ctx_->config->networkKeyLen > 0) {
-                Security::signPacket(pkt, ctx_->config->networkKey, ctx_->config->networkKeyLen);
-            }
-            enqueueOutgoing(ctx_, pkt);
-            return;
-        }
-    }
-
-    // --- Priority 3: Flood to all peers except last_hop ---
-    uint8_t floodMacs[MAX_NODES][6];
-    int count = ctx_->router->getFloodTargets(pkt, *ctx_->selfNode, floodMacs, MAX_NODES);
-    if (count == 0) {
-        LOG_WARN(TAG, "No forward path, dropping");
-        onPacketDropped(ctx_, pkt, "no forward path");
-        return;
+        // We have a direct path back!
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_DIRECT;
+        LOG_INFO(TAG, "Forwarding via DIRECT strategy (cached)");
+    } else if (pkt.header.dest_lat != 0.0f || pkt.header.dest_lon != 0.0f) {
+        // No direct path, but we have coordinates
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_GEO_FLOOD;
+        LOG_INFO(TAG, "Forwarding via GEO_FLOOD strategy");
+    } else {
+        // Fallback to blind broadcast
+        pkt.header.routing_strategy = (uint8_t)RoutingStrategy::STRAT_BROADCAST;
+        LOG_INFO(TAG, "Forwarding via BROADCAST strategy");
     }
 
     if (ctx_->config->networkKeyLen > 0) {
         Security::signPacket(pkt, ctx_->config->networkKey, ctx_->config->networkKeyLen);
     }
+    
     enqueueOutgoing(ctx_, pkt);
-    LOG_INFO(TAG, "Flood forwarding to %d peers", count);
 }
 
 } // namespace mesh

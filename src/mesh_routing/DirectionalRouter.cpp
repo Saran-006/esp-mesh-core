@@ -111,13 +111,47 @@ bool DirectionalRouter::selectNextHop(const Packet& pkt, const Node& self,
 
 int DirectionalRouter::getFloodTargets(const Packet& pkt, const Node& self,
                                        uint8_t outMacs[][6], int maxOut) const {
+    // If it's a blind broadcast, just flood to everyone
+    if (pkt.header.routing_strategy == (uint8_t)RoutingStrategy::STRAT_BROADCAST) {
+        Node nodes[MAX_NODES];
+        int count = registry_->getAll(nodes, MAX_NODES);
+        int idx = 0;
+        for (int i = 0; i < count && idx < maxOut; i++) {
+            if (memcmp(nodes[i].mac, pkt.header.last_hop_mac, 6) == 0) continue;
+            memcpy(outMacs[idx], nodes[i].mac, 6);
+            idx++;
+        }
+        return idx;
+    }
+
+    // Otherwise, handle Directional Flood (STRAT_GEO_FLOOD)
+    // We only forward to neighbors that make "progress" towards the destination
+    if (pkt.header.dest_lat == 0.0f && pkt.header.dest_lon == 0.0f) return 0;
+    if (!self.hasLocation()) return 0;
+
+    float targetBearing = bearing(self.lat, self.lon, pkt.header.dest_lat, pkt.header.dest_lon);
+    float distToDest = distanceM(self.lat, self.lon, pkt.header.dest_lat, pkt.header.dest_lon);
+
     Node nodes[MAX_NODES];
     int count = registry_->getAll(nodes, MAX_NODES);
     int idx = 0;
 
     for (int i = 0; i < count && idx < maxOut; i++) {
-        // Skip last hop
+        if (!nodes[i].hasLocation()) continue;
         if (memcmp(nodes[i].mac, pkt.header.last_hop_mac, 6) == 0) continue;
+
+        float peerBearing = bearing(self.lat, self.lon, nodes[i].lat, nodes[i].lon);
+        float aDiff = angleDiff(peerBearing, targetBearing);
+
+        // Angle filtering: only flood within the directional cone
+        if (aDiff > angleThreshold_) continue;
+
+        float peerDistToDest = distanceM(nodes[i].lat, nodes[i].lon, pkt.header.dest_lat, pkt.header.dest_lon);
+
+        // Progress Check: peer MUST be closer to destination than we are
+        // This prevents the "border waste" the user mentioned
+        if (peerDistToDest > distToDest - distanceTolerance_) continue;
+
         memcpy(outMacs[idx], nodes[i].mac, 6);
         idx++;
     }

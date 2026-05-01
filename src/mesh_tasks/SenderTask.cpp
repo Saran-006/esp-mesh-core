@@ -49,75 +49,58 @@ void senderTaskFn(void* param) {
             Security::signPacket(*pkt, ctx->config->networkKey, ctx->config->networkKeyLen);
         }
 
-        // Determine destination MAC
-        uint8_t destMac[6];
-        bool foundDest = false;
+        // Determine destination MACs based on routing strategy
+        uint8_t strategy = pkt->header.routing_strategy;
+        
+        if (strategy == (uint8_t)RoutingStrategy::STRAT_DIRECT) {
+            uint8_t destMac[6];
+            bool found = false;
 
-        uint8_t zeros[16] = {};
-        bool isBroadcast = (memcmp(pkt->header.dest_hash, zeros, 16) == 0);
-
-        if (isBroadcast) {
-            uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-            memcpy(destMac, broadcastMac, 6);
-            foundDest = true;
-        } else {
-            // 2. Try cached route (takes Mutex)
-            if (ctx->routeCache->lookupNextHop(pkt->header.dest_hash, destMac)) {
-                foundDest = true;
-            }
-
-            // 3. Try looking up dest_hash in registry
-            if (!foundDest) {
-                const Node* destNode = ctx->nodeRegistry->findByHash(pkt->header.dest_hash);
+            // 1. Try cached route
+            if (ctx_->routeCache->lookupNextHop(pkt->header.dest_hash, destMac)) {
+                found = true;
+            } else {
+                // 2. Try looking up in registry
+                const Node* destNode = ctx_->nodeRegistry->findByHash(pkt->header.dest_hash);
                 if (destNode) {
                     memcpy(destMac, destNode->mac, 6);
-                    foundDest = true;
+                    found = true;
                 }
             }
-        }
 
-        if (!foundDest) {
-            // 4. Flood: send to all known peers
-            Node* nodes = new Node[MAX_NODES];
-            int count = ctx->nodeRegistry->getAll(nodes, MAX_NODES);
-            if (count == 0) {
-                // Send to broadcast as last resort
-                uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-                memcpy(destMac, broadcastMac, 6);
-                foundDest = true;
+            if (found) {
+                ctx_->peerManager->addPeer(destMac);
+                size_t written = pkt->serialize(wireBuf, sizeof(wireBuf));
+                if (written > 0 && ctx_->transport->send(destMac, wireBuf, written)) {
+                    onPacketSent(ctx, *pkt);
+                    if (pkt->isAckRequired()) ctx_->ackManager->trackPacket(*pkt, destMac);
+                }
+            } else {
+                LOG_WARN(TAG, "Direct routing requested but no path found");
+            }
+        } else {
+            // STRAT_GEO_FLOOD or STRAT_BROADCAST
+            uint8_t floodMacs[MAX_NODES][6];
+            int count = ctx_->router->getFloodTargets(*pkt, *ctx_->selfNode, floodMacs, MAX_NODES);
+            
+            if (count == 0 && strategy == (uint8_t)RoutingStrategy::STRAT_BROADCAST) {
+                // Last resort blind broadcast if registry is empty
+                uint8_t bMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                ctx_->peerManager->addPeer(bMac);
+                size_t written = pkt->serialize(wireBuf, sizeof(wireBuf));
+                if (written > 0) ctx_->transport->send(bMac, wireBuf, written);
             } else {
                 for (int i = 0; i < count; i++) {
-                    if (memcmp(nodes[i].mac, ourMac, 6) == 0) continue;
-
-                    ctx->peerManager->addPeer(nodes[i].mac);
+                    ctx_->peerManager->addPeer(floodMacs[i]);
                     size_t written = pkt->serialize(wireBuf, sizeof(wireBuf));
-                    if (written > 0) {
-                        ctx->transport->send(nodes[i].mac, wireBuf, written);
-                    }
+                    if (written > 0) ctx_->transport->send(floodMacs[i], wireBuf, written);
                 }
-
+                LOG_INFO(TAG, "Flood sent to %d peers (Strategy: %d)", count, strategy);
                 if (pkt->isAckRequired() && count > 0) {
-                    ctx->ackManager->trackPacket(*pkt, nodes[0].mac);
-                }
-
-                onPacketSent(ctx, *pkt);
-                delete[] nodes;
-                delete pkt;
-                continue;
-            }
-            delete[] nodes;
-        }
-
-        // Single destination send (Broadcast MAC or Registered Peer)
-        ctx->peerManager->addPeer(destMac);
-        size_t written = pkt->serialize(wireBuf, sizeof(wireBuf));
-        if (written > 0) {
-            if (ctx->transport->send(destMac, wireBuf, written)) {
-                onPacketSent(ctx, *pkt);
-                if (pkt->isAckRequired()) {
-                    ctx->ackManager->trackPacket(*pkt, destMac);
+                    ctx_->ackManager->trackPacket(*pkt, floodMacs[0]);
                 }
             }
+            onPacketSent(ctx, *pkt);
         }
         delete pkt;
     }

@@ -19,6 +19,16 @@ static void ackRetryCb(const Packet& pkt, const uint8_t destMac[6], void* userCt
     enqueueOutgoing(ctx, pkt);
 }
 
+// Failure callback: if a node fails to ACK, prune it from registry and cache
+static void ackFailureCb(const uint8_t destMac[6], void* userCtx) {
+    MeshContext* ctx = static_cast<MeshContext*>(userCtx);
+    LOG_WARN(TAG, "Node %02X:%02X:%02X:%02X:%02X:%02X failed to ACK, initiating self-healing", 
+             destMac[0], destMac[1], destMac[2], destMac[3], destMac[4], destMac[5]);
+    
+    ctx->nodeRegistry->removeByMac(destMac);
+    ctx->routeCache->removeByNextHop(destMac);
+}
+
 void healthTaskFn(void* param) {
     MeshContext* ctx = static_cast<MeshContext*>(param);
 
@@ -33,8 +43,8 @@ void healthTaskFn(void* param) {
             LOG_INFO(TAG, "Pruned %d stale nodes", pruned);
         }
 
-        // 2. Process ACK retries
-        ctx->ackManager->processRetries(now, ackRetryCb, ctx);
+        // 2. Process ACK retries and handle dead links
+        ctx->ackManager->processRetries(now, ackRetryCb, ackFailureCb, ctx);
 
         // 3. Prune stale fragment assemblies
         ctx->fragmentManager->pruneStale(now);
